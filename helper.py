@@ -9,7 +9,9 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 import easyocr
-from shapely.geometry import Polygon, box
+from shapely.geometry import Polygon, box, LineString
+from skimage import feature, morphology, measure
+from scipy import ndimage
 import matplotlib.pyplot as plt
 
 # Configure Tesseract path for Windows
@@ -24,14 +26,146 @@ from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 
 
+def detect_walls(image_np: np.ndarray) -> List[LineString]:
+    """Detect walls in blueprint using edge detection and line detection."""
+    # Convert to grayscale
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    
+    # Edge detection
+    edges = feature.canny(gray, sigma=2)
+    
+    # Dilate edges to connect nearby lines
+    dilated = morphology.dilation(edges, morphology.disk(2))
+    
+    # Detect lines using probabilistic Hough transform
+    lines = cv2.HoughLinesP(
+        dilated.astype(np.uint8) * 255,
+        rho=1,
+        theta=np.pi/180,
+        threshold=50,
+        minLineLength=50,
+        maxLineGap=10
+    )
+    
+    wall_lines = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            wall_lines.append(LineString([(x1, y1), (x2, y2)]))
+    
+    return wall_lines
+
+
+def detect_rooms(image_np: np.ndarray) -> List[Dict]:
+    """Detect rooms and calculate their areas."""
+    # Convert to grayscale
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    
+    # Threshold to get binary image
+    _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
+    
+    # Remove small objects and fill holes
+    cleaned = morphology.remove_small_objects(binary.astype(bool), min_size=1000)
+    filled = ndimage.binary_fill_holes(cleaned)
+    
+    # Label connected components (rooms)
+    labeled_rooms = measure.label(filled)
+    regions = measure.regionprops(labeled_rooms)
+    
+    rooms = []
+    for region in regions:
+        # Get room boundary
+        boundary = region.coords
+        # Convert to polygon
+        polygon = Polygon([(point[1], point[0]) for point in boundary])
+        
+        rooms.append({
+            'area': region.area,
+            'perimeter': region.perimeter,
+            'centroid': region.centroid,
+            'bbox': region.bbox,
+            'polygon': polygon
+        })
+    
+    return rooms
+
+
+def detect_symbols(image_np: np.ndarray) -> List[Dict]:
+    """Detect architectural symbols (doors, windows, etc.)."""
+    # Convert to grayscale
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    
+    # Template matching could be used here for specific symbols
+    # For now, we'll detect basic shapes
+    
+    # Detect circles (could be electrical outlets, columns)
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1,
+        minDist=20,
+        param1=50,
+        param2=30,
+        minRadius=5,
+        maxRadius=30
+    )
+    
+    symbols = []
+    if circles is not None:
+        circles = np.uint16(np.around(circles))
+        for circle in circles[0, :]:
+            x, y, r = circle
+            symbols.append({
+                'type': 'circle',
+                'center': (x, y),
+                'radius': r
+            })
+    
+    return symbols
+
+
+def analyze_blueprint_elements(page: fitz.Page) -> Dict:
+    """Analyze different elements in a blueprint page."""
+    # Convert page to image
+    pix = page.get_pixmap()
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    
+    # Detect walls
+    walls = detect_walls(img)
+    
+    # Detect rooms
+    rooms = detect_rooms(img)
+    
+    # Detect architectural symbols
+    symbols = detect_symbols(img)
+    
+    # Extract text and measurements from page
+    text = page.get_text()
+    measurements = extract_measurements(text)
+    
+    return {
+        'walls': [{'coords': list(wall.coords)} for wall in walls],
+        'rooms': [{
+            'area_pixels': room['area'],
+            'perimeter_pixels': room['perimeter'],
+            'centroid': room['centroid'],
+            'bbox': room['bbox']
+        } for room in rooms],
+        'symbols': symbols,
+        'measurements': measurements,
+        'page_number': page.number + 1,
+        'page_size': (page.rect.width, page.rect.height)
+    }
+
+
 def extract_measurements(text: str) -> List[Dict[str, str]]:
     """Extract measurements with their context from text."""
     # Common measurement patterns in blueprints
     patterns = [
         r'(\d+(?:\.\d+)?)\s*(?:mm|cm|m|ft|\'|\"|\binch(?:es)?\b|\bfeet\b)',  # Basic measurements
-        r'(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:mm|cm|m|ft|\'|\")',  # Dimensions like 10x20 ft
+        r'(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:mm|cm|m|ft|\'|\")',  # Dimensions
         r'(\d+(?:\.\d+)?)\s*(?:sq\.?\s*ft|square\s*feet)',  # Area measurements
-        r'(?:width|length|height|depth|radius|diameter)\s*(?:of|:|\=)?\s*(\d+(?:\.\d+)?)\s*(?:mm|cm|m|ft|\'|\")',  # Labeled measurements
+        r'(?:width|length|height|depth|radius|diameter)\s*(?:of|:|\=)?\s*(\d+(?:\.\d+)?)\s*(?:mm|cm|m|ft|\'|\")'  # Labeled measurements
     ]
     
     measurements = []
@@ -52,140 +186,50 @@ def extract_measurements(text: str) -> List[Dict[str, str]]:
     return measurements
 
 
-def detect_shapes(image_np: np.ndarray) -> List[Dict]:
-    """Detect geometric shapes in blueprint using OpenCV."""
-    # Convert to grayscale
-    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
-    # Apply threshold
-    _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-    # Find contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    shapes = []
-    for contour in contours:
-        # Approximate the contour to a polygon
-        epsilon = 0.02 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-        
-        # Get shape type based on number of vertices
-        vertices = len(approx)
-        shape_type = 'unknown'
-        if vertices == 3:
-            shape_type = 'triangle'
-        elif vertices == 4:
-            x, y, w, h = cv2.boundingRect(approx)
-            aspect_ratio = float(w)/h
-            if 0.95 <= aspect_ratio <= 1.05:
-                shape_type = 'square'
-            else:
-                shape_type = 'rectangle'
-        elif vertices > 4:
-            shape_type = 'circle' if vertices > 8 else 'polygon'
-        
-        # Calculate area and perimeter
-        area = cv2.contourArea(contour)
-        perimeter = cv2.arcLength(contour, True)
-        
-        shapes.append({
-            'type': shape_type,
-            'vertices': vertices,
-            'area': area,
-            'perimeter': perimeter,
-            'coordinates': approx.tolist()
-        })
-    
-    return shapes
-
-
-def detect_text_regions(image_np: np.ndarray) -> List[Dict]:
-    """Extract text regions using Tesseract and EasyOCR."""
-    # Get text regions from EasyOCR
-    results = reader.readtext(image_np)
-    
-    text_regions = []
-    for (bbox, text, conf) in results:
-        # Convert bbox to Shapely polygon for geometric operations
-        polygon = Polygon([
-            (bbox[0][0], bbox[0][1]),  # top-left
-            (bbox[1][0], bbox[1][1]),  # top-right
-            (bbox[2][0], bbox[2][1]),  # bottom-right
-            (bbox[3][0], bbox[3][1])   # bottom-left
-        ])
-        
-        text_regions.append({
-            'text': text,
-            'confidence': conf,
-            'bbox': bbox,
-            'area': polygon.area,
-            'centroid': (polygon.centroid.x, polygon.centroid.y)
-        })
-    
-    return text_regions
-
-
-def analyze_blueprint_elements(page: fitz.Page) -> Dict:
-    """Analyze different elements in a blueprint page."""
-    # Convert page to image
-    pix = page.get_pixmap()
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-    
-    # Detect shapes
-    shapes = detect_shapes(img)
-    
-    # Detect text regions
-    text_regions = detect_text_regions(img)
-    
-    # Extract measurements from text
-    measurements = []
-    for region in text_regions:
-        text = region['text']
-        # Look for common measurement patterns
-        if any(unit in text.lower() for unit in ['mm', 'cm', 'm', 'ft', 'in', '"', "'"]):
-            measurements.append({
-                'text': text,
-                'location': region['centroid'],
-                'confidence': region['confidence']
-            })
-    
-    return {
-        'shapes': shapes,
-        'text_regions': text_regions,
-        'measurements': measurements,
-        'page_number': page.number + 1,
-        'page_size': (page.rect.width, page.rect.height)
-    }
-
-
-def process_pdf_to_document(pdf_path: str) -> Document:
-    """Process PDF document and extract text, drawings, and measurements."""
+def process_pdf_to_document(pdf_path: str) -> List[Document]:
+    """Process PDF document and extract text, drawings, and measurements.
+    Returns a list of Documents, one per page."""
     doc = fitz.open(pdf_path)
-    content = []
-    metadata = {
-        'total_pages': len(doc),
-        'filename': os.path.basename(pdf_path),
-        'elements_by_page': []
-    }
+    documents = []
     
     for page in doc:
-        # Extract text
-        text = page.get_text()
-        
         # Analyze blueprint elements
         elements = analyze_blueprint_elements(page)
-        metadata['elements_by_page'].append(elements)
         
-        # Add page content with context
-        content.append(f"Page {page.number + 1}:\n{text}\n")
+        # Create content for this page
+        content = []
+        content.append(f"Page {page.number + 1}:\n")
         
-        # Add shape descriptions
-        for shape in elements['shapes']:
-            content.append(f"Found {shape['type']} with area {shape['area']:.2f}\n")
+        # Add room descriptions with detailed measurements
+        for i, room in enumerate(elements['rooms']):
+            content.append(f"Room {i+1}:\n")
+            content.append(f"  Area: {room['area_pixels']} pixels\n")
+            content.append(f"  Perimeter: {room['perimeter_pixels']} pixels\n")
+            content.append(f"  Location: center at {room['centroid']}\n")
+            content.append(f"  Bounding box: {room['bbox']}\n")
         
         # Add measurement descriptions
         for measurement in elements['measurements']:
-            content.append(f"Measurement found: {measurement['text']}\n")
+            content.append(f"Measurement: {measurement['measurement']}\n")
+            content.append(f"Context: {measurement['context']}\n")
+            content.append(f"Location: {measurement['location']}\n")
+        
+        # Add symbol descriptions
+        for symbol in elements['symbols']:
+            content.append(f"Symbol: {symbol['type']} at {symbol['center']}\n")
+        
+        # Create a document for this page
+        page_doc = Document(
+            text='\n'.join(content),
+            metadata={
+                'page_number': page.number + 1,
+                'filename': os.path.basename(pdf_path),
+                'page_elements': elements
+            }
+        )
+        documents.append(page_doc)
     
-    return Document(text='\n'.join(content), metadata=metadata)
+    return documents
 
 
 def ocr_pdf_document(pdf_path: str) -> Document:
@@ -250,40 +294,33 @@ def initialize_llama_index(documents_path: str = "./documents"):
         
         # Process documents
         print(f"Processing technical documents from: {documents_path}")
-        documents = []
+        all_documents = []
         
         for filename in os.listdir(documents_path):
             if filename.lower().endswith('.pdf'):
                 file_path = os.path.join(documents_path, filename)
                 
-                # First, try text-based extraction
-                doc = process_pdf_to_document(file_path)
-                
-                # If doc is None or doc.text is empty, fallback to OCR
-                if (not doc) or (not doc.text.strip()):
-                    print(f"No text found in {filename}, switching to OCR.")
-                    doc = ocr_pdf_document(file_path)
-                
-                if doc:
-                    documents.append(doc)
-                    print(f"Successfully processed (PDF) with text or OCR: {filename}")
+                # Process PDF into per-page documents
+                page_documents = process_pdf_to_document(file_path)
+                if page_documents:
+                    all_documents.extend(page_documents)
+                    print(f"Successfully processed {len(page_documents)} pages from: {filename}")
         
-        if not documents:
+        if not all_documents:
             raise ValueError("No documents were successfully processed")
         
-        # Create index with larger chunk size
+        # Create index with standard chunk size (now safe because metadata is per-page)
         print("Creating technical document index...")
         from llama_index.core.node_parser import SimpleNodeParser
         
-        # Configure parser with larger chunk size
         parser = SimpleNodeParser.from_defaults(
-            chunk_size=4096,  # Increased from default 1024
+            chunk_size=4096,
             chunk_overlap=50
         )
         
         index = VectorStoreIndex.from_documents(
-            documents,
-            transformations=[parser]  # Use our configured parser
+            all_documents,
+            transformations=[parser]
         )
         
         print("Technical document index created successfully")
@@ -300,26 +337,18 @@ def create_chat_engine(index):
     return index.as_chat_engine(
         chat_mode="context",
         verbose=True,
-        context_template=(
-            "You are an expert in analyzing technical drawings, blueprints, and engineering documentation. "
-            "Focus on providing precise, technical information including measurements, dimensions, and specifications. "
-            "\n\nWhen discussing measurements:\n"
-            "- Always specify the units (ft, inches, mm, etc.)\n"
-            "- Provide context for where the measurement was found\n"
-            "- If relevant, explain what the measurement refers to (e.g., room width, door height)\n"
-            "- If asked about areas or volumes, show your calculations\n"
-            "\n\nWhen discussing blueprints:\n"
-            "- Reference specific pages and sections\n"
-            "- Describe the location of elements using clear spatial terms\n"
-            "- Mention any relevant annotations or notes\n"
-            "- If discussing layout, provide clear directional guidance\n"
-            "\n\nIf you're unsure about any technical detail, say so rather than making assumptions. "
-            "Use technical terminology appropriate for architectural and engineering contexts.\n\n"
-            "Context information is below.\n"
-            "---------------------\n"
-            "{context_str}\n"
-            "---------------------\n"
-            "Given this context, please respond to the question: {query_str}\n"
+        system_prompt=(
+            "You are an expert in analyzing technical drawings and blueprints. "
+            "Focus on providing precise information about:\n"
+            "1. Room layouts and dimensions\n"
+            "2. Wall locations and lengths\n"
+            "3. Architectural symbols and their meanings\n"
+            "4. Measurements and scale information\n"
+            "\nWhen discussing measurements:\n"
+            "- Convert pixel measurements to real units when scale information is available\n"
+            "- Provide context about where elements are located\n"
+            "- Explain relationships between different spaces\n"
+            "\nIf you're unsure about any measurements or interpretations, say so."
         )
     )
 

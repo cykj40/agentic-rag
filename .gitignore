@@ -175,3 +175,7 @@ cython_debug/
 # Project specific
 documents/
 *.pdf
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
