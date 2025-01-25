@@ -1,22 +1,14 @@
-# LlamaIndex and OpenAI
+# Core dependencies
 llama-index==0.10.27
 llama-index-llms-openai==0.1.15
 llama-index-embeddings-openai==0.1.7
 openai>=1.1.0
 python-dotenv==1.0.0
-
-# LangChain or langchain-openai
-langchain>=0.1.0
-langchain-community>=0.0.10
 langchain-openai>=0.0.2
 
-# PDF and Image processing
-pdf2image==1.17.0
-pytesseract==0.3.10
-opencv-python==4.9.0.80
-Pillow==10.2.0
-pypdf==4.0.1
+# PDF Processing
 PyMuPDF==1.23.8
+Pillow==10.2.0
 
 # UI
 streamlit==1.31.0

@@ -1,7 +1,6 @@
 import os
 import traceback
 from dotenv import load_dotenv, find_dotenv
-from pdf2image import convert_from_path
 import pytesseract
 from PIL import Image
 import cv2
@@ -20,6 +19,7 @@ from langchain_openai import ChatOpenAI
 # from langchain.chat_models import ChatOpenAI
 
 import fitz
+import io
 
 # Configure Tesseract for Windows
 if os.name == 'nt':  # Windows
@@ -41,102 +41,142 @@ def check_environment():
 
 
 def process_pdf_to_document(pdf_path: str) -> Document:
-    """
-    Convert a single PDF to a LlamaIndex Document via OCR.
-    Each page is turned into text, then joined into a single string.
-    """
-    print(f"Processing PDF for OCR: {pdf_path}")
+    """Process technical PDFs with focus on blueprint content"""
+    print(f"Processing technical document: {pdf_path}")
     
-    # Convert PDF to images
-    images = convert_from_path(pdf_path)
-    print(f"  -> Found {len(images)} pages in PDF")
-
-    extracted_texts = []
-    for i, image in enumerate(images):
-        print(f"  -> OCR page {i+1}/{len(images)} of {os.path.basename(pdf_path)}")
-        # Convert to OpenCV format
-        opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        # Preprocess for better OCR
-        gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-        denoised = cv2.fastNlMeansDenoising(gray)
-        threshold = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-        # Perform OCR
-        text = pytesseract.image_to_string(threshold)
-        extracted_texts.append(f"Page {i+1}:\n{text.strip()}")
-
-    full_text = "\n\n".join(extracted_texts)
-    # Create a single Document object with the text from all pages
-    return Document(
-        text=full_text,
-        metadata={
-            "source": pdf_path,
-            "type": "technical_drawing"
-        },
-    )
+    try:
+        pdf_document = fitz.open(pdf_path)
+        print(f"Document loaded: {len(pdf_document)} pages")
+        
+        extracted_content = []
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            
+            # Get basic text
+            text = page.get_text()
+            
+            # Get technical elements
+            drawings = page.get_drawings()
+            annotations = page.annots()
+            
+            # Extract measurements and dimensions
+            blocks = page.get_text("blocks")  # Gets text with position info
+            
+            # Combine page content
+            page_content = [f"Page {page_num + 1} Content:"]
+            page_content.append(f"Text Content:\n{text}")
+            
+            if drawings:
+                page_content.append(f"Technical Elements: {len(drawings)} drawing elements found")
+            
+            if annotations:
+                annot_text = [a.info.get("content", "") for a in annotations if a.info.get("content")]
+                if annot_text:
+                    page_content.append(f"Annotations:\n{' '.join(annot_text)}")
+            
+            if blocks:
+                measurements = [b[4] for b in blocks if any(unit in b[4].lower() for unit in ['mm', 'cm', 'm', 'inch', 'ft', '"', "'"])]
+                if measurements:
+                    page_content.append(f"Measurements found:\n{' '.join(measurements)}")
+            
+            extracted_content.append("\n".join(page_content))
+        
+        pdf_document.close()
+        
+        # Create a rich document with metadata
+        return Document(
+            text="\n\n".join(extracted_content),
+            metadata={
+                "source": pdf_path,
+                "type": "technical_drawing",
+                "pages": len(pdf_document),
+                "filename": os.path.basename(pdf_path)
+            }
+        )
+        
+    except Exception as e:
+        print(f"Error processing document: {str(e)}")
+        traceback.print_exc()
+        return None
 
 
 def build_documents_list(docs_folder: str) -> list:
-    """
-    Iterate over all PDFs in the docs_folder, OCR each one,
-    and return a list of LlamaIndex Document objects.
-    """
+    """Process all PDFs in the folder"""
     all_docs = []
+    print(f"Scanning folder: {docs_folder}")
+    
     for fname in os.listdir(docs_folder):
-        fpath = os.path.join(docs_folder, fname)
-        if fpath.lower().endswith('.pdf'):
-            print(f"Found PDF: {fname}, converting to Document...")
-            try:
-                doc = process_pdf_to_document(fpath)
+        if fname.lower().endswith('.pdf'):
+            fpath = os.path.join(docs_folder, fname)
+            print(f"Found PDF: {fname}")
+            doc = process_pdf_to_document(fpath)
+            if doc:
                 all_docs.append(doc)
-            except Exception as e:
-                print(f"Error processing {fname}: {str(e)}")
-                traceback.print_exc()
+                print(f"Successfully processed: {fname}")
+    
     return all_docs
 
 
 def initialize_llama_index(documents_path: str = "./documents"):
-    """
-    Initialize and return a VectorStoreIndex with all PDFs in `documents_path`.
-    """
+    """Initialize RAG system with technical document understanding"""
     try:
-        # Load environment
-        load_env()
+        # Verify environment
+        load_dotenv(find_dotenv())
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise ValueError("OpenAI API key not found in environment variables")
+            raise ValueError("OpenAI API key not found in environment")
         
-        print("Building documents from all PDFs in:", documents_path)
-        docs = build_documents_list(documents_path)
-        if not docs:
-            print("No documents were successfully processed via OCR.")
-            return None
+        # Process all documents
+        print(f"Processing technical documents from: {documents_path}")
+        documents = []
         
-        print("Configuring LLM and embeddings...")
-        llm = ChatOpenAI(model="gpt-4", api_key=api_key)
+        for filename in os.listdir(documents_path):
+            if filename.lower().endswith('.pdf'):
+                file_path = os.path.join(documents_path, filename)
+                doc = process_pdf_to_document(file_path)
+                if doc:
+                    documents.append(doc)
+                    print(f"Successfully processed: {filename}")
+        
+        if not documents:
+            raise ValueError("No documents were successfully processed")
+        
+        # Create optimized index
+        print("Creating technical document index...")
+        llm = ChatOpenAI(
+            model="gpt-4",
+            api_key=api_key,
+            temperature=0.2  # Lower temperature for more precise technical responses
+        )
+        
         embed_model = OpenAIEmbedding(api_key=api_key)
         
-        print("Creating index...")
-        index = VectorStoreIndex.from_documents(docs, embed_model=embed_model)
-        print("Index created successfully.")
+        index = VectorStoreIndex.from_documents(
+            documents,
+            embed_model=embed_model
+        )
+        
+        print("Technical document index created successfully")
         return index
+        
     except Exception as e:
-        print(f"Error in initialize_llama_index: {str(e)}")
+        print(f"Index creation error: {str(e)}")
         traceback.print_exc()
         return None
 
 
 def create_chat_engine(index):
-    """
-    Create a chat engine optimized for technical (blueprint) documents.
-    """
+    """Create a specialized chat engine for technical documents"""
     return index.as_chat_engine(
         chat_mode="condense_question",
         verbose=True,
         system_prompt=(
-            "You are an expert in analyzing technical drawings, blueprints, "
-            "and documentation. Focus on providing precise, technical "
-            "information from the documents."
-        ),
+            "You are an expert in analyzing technical drawings, blueprints, and engineering documentation. "
+            "Focus on providing precise, technical information including measurements, dimensions, and specifications. "
+            "When discussing blueprints, reference specific pages and sections. "
+            "If you're unsure about any technical detail, say so rather than making assumptions. "
+            "Use technical terminology appropriate for architectural and engineering contexts."
+        )
     )
 
 
