@@ -55,24 +55,25 @@ def main():
                         st.error(f"Error: {str(e)}")
         
         # Chat Interface
+        st.markdown("### Chat")
         if st.session_state.chat_engine:
             # Display chat messages
             for message in st.session_state.messages:
                 with st.chat_message(message["role"]):
-                    st.write(message["content"])
+                    st.markdown(message["content"])
             
             # Chat input
             if prompt := st.chat_input("Ask about your blueprints..."):
                 # Add user message
                 st.session_state.messages.append({"role": "user", "content": prompt})
                 with st.chat_message("user"):
-                    st.write(prompt)
+                    st.markdown(prompt)
                 
                 # Generate and display assistant response
                 with st.chat_message("assistant"):
                     with st.spinner("Analyzing..."):
                         response = st.session_state.chat_engine.chat(prompt)
-                        st.write(response.response)
+                        st.markdown(response.response)
                         st.session_state.messages.append({
                             "role": "assistant",
                             "content": response.response
@@ -107,7 +108,7 @@ def main():
             else:
                 st.info("No documents available. Upload a PDF to get started!")
         else:
-            st.info("Documents folder not found. Upload a document first!")
+            st.info("Upload a document to view it here!")
 
 if __name__ == "__main__":
     main()

@@ -45,54 +45,53 @@ def process_pdf_to_document(pdf_path: str) -> Document:
     print(f"Processing technical document: {pdf_path}")
     
     try:
-        pdf_document = fitz.open(pdf_path)
-        print(f"Document loaded: {len(pdf_document)} pages")
-        
-        extracted_content = []
-        for page_num in range(len(pdf_document)):
-            page = pdf_document[page_num]
+        with fitz.open(pdf_path) as pdf_document:  # Use context manager
+            page_count = len(pdf_document)
+            print(f"Document loaded: {page_count} pages")
             
-            # Get basic text
-            text = page.get_text()
+            extracted_content = []
+            for page_num in range(page_count):
+                page = pdf_document[page_num]
+                
+                # Get basic text
+                text = page.get_text()
+                
+                # Get technical elements
+                drawings = page.get_drawings()
+                annotations = page.annots()
+                
+                # Extract measurements and dimensions
+                blocks = page.get_text("blocks")
+                
+                # Combine page content
+                page_content = [f"Page {page_num + 1} Content:"]
+                page_content.append(f"Text Content:\n{text}")
+                
+                if drawings:
+                    page_content.append(f"Technical Elements: {len(drawings)} drawing elements found")
+                
+                if annotations:
+                    annot_text = [a.info.get("content", "") for a in annotations if a.info.get("content")]
+                    if annot_text:
+                        page_content.append(f"Annotations:\n{' '.join(annot_text)}")
+                
+                if blocks:
+                    measurements = [b[4] for b in blocks if any(unit in b[4].lower() for unit in ['mm', 'cm', 'm', 'inch', 'ft', '"', "'"])]
+                    if measurements:
+                        page_content.append(f"Measurements found:\n{' '.join(measurements)}")
+                
+                extracted_content.append("\n".join(page_content))
             
-            # Get technical elements
-            drawings = page.get_drawings()
-            annotations = page.annots()
-            
-            # Extract measurements and dimensions
-            blocks = page.get_text("blocks")  # Gets text with position info
-            
-            # Combine page content
-            page_content = [f"Page {page_num + 1} Content:"]
-            page_content.append(f"Text Content:\n{text}")
-            
-            if drawings:
-                page_content.append(f"Technical Elements: {len(drawings)} drawing elements found")
-            
-            if annotations:
-                annot_text = [a.info.get("content", "") for a in annotations if a.info.get("content")]
-                if annot_text:
-                    page_content.append(f"Annotations:\n{' '.join(annot_text)}")
-            
-            if blocks:
-                measurements = [b[4] for b in blocks if any(unit in b[4].lower() for unit in ['mm', 'cm', 'm', 'inch', 'ft', '"', "'"])]
-                if measurements:
-                    page_content.append(f"Measurements found:\n{' '.join(measurements)}")
-            
-            extracted_content.append("\n".join(page_content))
-        
-        pdf_document.close()
-        
-        # Create a rich document with metadata
-        return Document(
-            text="\n\n".join(extracted_content),
-            metadata={
-                "source": pdf_path,
-                "type": "technical_drawing",
-                "pages": len(pdf_document),
-                "filename": os.path.basename(pdf_path)
-            }
-        )
+            # Create a rich document with metadata
+            return Document(
+                text="\n\n".join(extracted_content),
+                metadata={
+                    "source": pdf_path,
+                    "type": "technical_drawing",
+                    "pages": page_count,
+                    "filename": os.path.basename(pdf_path)
+                }
+            )
         
     except Exception as e:
         print(f"Error processing document: {str(e)}")
@@ -143,12 +142,6 @@ def initialize_llama_index(documents_path: str = "./documents"):
         
         # Create optimized index
         print("Creating technical document index...")
-        llm = ChatOpenAI(
-            model="gpt-4",
-            api_key=api_key,
-            temperature=0.2  # Lower temperature for more precise technical responses
-        )
-        
         embed_model = OpenAIEmbedding(api_key=api_key)
         
         index = VectorStoreIndex.from_documents(
@@ -181,19 +174,18 @@ def create_chat_engine(index):
 
 
 def visualize_document(file_path):
-    """Convert each page of the PDF into an image (using PyMuPDF/fitz) or show an image file."""
+    """Convert each page of the PDF into an image"""
     try:
         if file_path.lower().endswith('.pdf'):
-            doc = fitz.open(file_path)
-            pages = []
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                pix = page.get_pixmap()
-                img_data = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                pages.append(img_data)
-            return pages
+            with fitz.open(file_path) as doc:  # Use context manager
+                pages = []
+                for page_num in range(len(doc)):
+                    page = doc[page_num]
+                    pix = page.get_pixmap()
+                    img_data = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    pages.append(img_data)
+                return pages
         else:
-            # If not PDF, assume it's an image
             return [Image.open(file_path)]
     except Exception as e:
         print(f"Error visualizing {file_path}: {str(e)}")
