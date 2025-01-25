@@ -1,51 +1,18 @@
 import os
 import traceback
 from dotenv import load_dotenv, find_dotenv
-import pytesseract
 from PIL import Image
-import cv2
-import numpy as np
-
-# IMPORTANT: Depending on your LlamaIndex version, the import paths may differ:
-# If "Document" is not found in llama_index.core, use: 
-# from llama_index import Document
-# or from llama_index.schema import Document
-from llama_index.core import VectorStoreIndex, Document
-from llama_index.embeddings.openai import OpenAIEmbedding
-
-# If you use `langchain-openai`:
-from langchain_openai import ChatOpenAI
-# Otherwise, if using stock LangChain:
-# from langchain.chat_models import ChatOpenAI
-
 import fitz
-import io
-
-# Configure Tesseract for Windows
-if os.name == 'nt':  # Windows
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-
-def load_env():
-    """Load environment variables from .env file."""
-    _ = load_dotenv(find_dotenv())
-
-
-def check_environment():
-    """Check if environment is properly configured."""
-    load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise EnvironmentError("OPENAI_API_KEY not found in environment variables")
-    return True
-
+from llama_index.core import VectorStoreIndex, Document, Settings
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
 
 def process_pdf_to_document(pdf_path: str) -> Document:
     """Process technical PDFs with focus on blueprint content"""
     print(f"Processing technical document: {pdf_path}")
     
     try:
-        with fitz.open(pdf_path) as pdf_document:  # Use context manager
+        with fitz.open(pdf_path) as pdf_document:
             page_count = len(pdf_document)
             print(f"Document loaded: {page_count} pages")
             
@@ -82,7 +49,7 @@ def process_pdf_to_document(pdf_path: str) -> Document:
                 
                 extracted_content.append("\n".join(page_content))
             
-            # Create a rich document with metadata
+            # Create document
             return Document(
                 text="\n\n".join(extracted_content),
                 metadata={
@@ -98,34 +65,27 @@ def process_pdf_to_document(pdf_path: str) -> Document:
         traceback.print_exc()
         return None
 
-
-def build_documents_list(docs_folder: str) -> list:
-    """Process all PDFs in the folder"""
-    all_docs = []
-    print(f"Scanning folder: {docs_folder}")
-    
-    for fname in os.listdir(docs_folder):
-        if fname.lower().endswith('.pdf'):
-            fpath = os.path.join(docs_folder, fname)
-            print(f"Found PDF: {fname}")
-            doc = process_pdf_to_document(fpath)
-            if doc:
-                all_docs.append(doc)
-                print(f"Successfully processed: {fname}")
-    
-    return all_docs
-
-
 def initialize_llama_index(documents_path: str = "./documents"):
     """Initialize RAG system with technical document understanding"""
     try:
-        # Verify environment
+        # Load environment
         load_dotenv(find_dotenv())
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OpenAI API key not found in environment")
+
+        # Configure LLM and embeddings
+        Settings.llm = OpenAI(
+            model="gpt-4",
+            api_key=api_key,
+            temperature=0.7
+        )
+        Settings.embed_model = OpenAIEmbedding(
+            api_key=api_key,
+            model="text-embedding-3-small"
+        )
         
-        # Process all documents
+        # Process documents
         print(f"Processing technical documents from: {documents_path}")
         documents = []
         
@@ -140,15 +100,9 @@ def initialize_llama_index(documents_path: str = "./documents"):
         if not documents:
             raise ValueError("No documents were successfully processed")
         
-        # Create optimized index
+        # Create index
         print("Creating technical document index...")
-        embed_model = OpenAIEmbedding(api_key=api_key)
-        
-        index = VectorStoreIndex.from_documents(
-            documents,
-            embed_model=embed_model
-        )
-        
+        index = VectorStoreIndex.from_documents(documents)
         print("Technical document index created successfully")
         return index
         
@@ -157,27 +111,30 @@ def initialize_llama_index(documents_path: str = "./documents"):
         traceback.print_exc()
         return None
 
-
 def create_chat_engine(index):
     """Create a specialized chat engine for technical documents"""
     return index.as_chat_engine(
-        chat_mode="condense_question",
+        chat_mode="context",
         verbose=True,
-        system_prompt=(
+        context_template=(
             "You are an expert in analyzing technical drawings, blueprints, and engineering documentation. "
             "Focus on providing precise, technical information including measurements, dimensions, and specifications. "
             "When discussing blueprints, reference specific pages and sections. "
             "If you're unsure about any technical detail, say so rather than making assumptions. "
-            "Use technical terminology appropriate for architectural and engineering contexts."
+            "Use technical terminology appropriate for architectural and engineering contexts.\n\n"
+            "Context information is below.\n"
+            "---------------------\n"
+            "{context_str}\n"
+            "---------------------\n"
+            "Given this context, please respond to the question: {query_str}\n"
         )
     )
-
 
 def visualize_document(file_path):
     """Convert each page of the PDF into an image"""
     try:
         if file_path.lower().endswith('.pdf'):
-            with fitz.open(file_path) as doc:  # Use context manager
+            with fitz.open(file_path) as doc:
                 pages = []
                 for page_num in range(len(doc)):
                     page = doc[page_num]

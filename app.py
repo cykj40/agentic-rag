@@ -1,5 +1,5 @@
 import streamlit as st
-from helper import check_environment, initialize_llama_index, create_chat_engine, visualize_document
+from helper import initialize_llama_index, create_chat_engine, visualize_document
 import os
 
 def init_session_state():
@@ -43,16 +43,16 @@ def main():
             if st.button("Process Documents", type="primary"):
                 with st.spinner("Processing documents..."):
                     try:
-                        check_environment()
                         index = initialize_llama_index()
                         if index:
                             st.session_state.chat_engine = create_chat_engine(index)
                             st.success("✅ Documents processed successfully!")
-                            st.rerun()  # Refresh to show chat interface
+                            st.rerun()
                         else:
                             st.error("Failed to process documents")
                     except Exception as e:
                         st.error(f"Error: {str(e)}")
+                        st.error("Make sure your OpenAI API key is set correctly in the .env file")
         
         # Chat Interface
         st.markdown("### Chat")
