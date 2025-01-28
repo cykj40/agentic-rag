@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 
 # Configure Tesseract path for Windows
 if os.name == 'nt':  # Windows
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    pytesseract.pytesseract.tesseract_cmd = r'C:\ProgramFiles\Tesseract\tesseract.exe'
 
 # Initialize EasyOCR reader
 reader = easyocr.Reader(['en'])
@@ -309,13 +309,13 @@ def initialize_llama_index(documents_path: str = "./documents"):
         if not all_documents:
             raise ValueError("No documents were successfully processed")
         
-        # Create index with standard chunk size (now safe because metadata is per-page)
+        # Create index with much larger chunk size for detailed metadata
         print("Creating technical document index...")
         from llama_index.core.node_parser import SimpleNodeParser
         
         parser = SimpleNodeParser.from_defaults(
-            chunk_size=4096,
-            chunk_overlap=50
+            chunk_size=500000,  # Increased significantly to handle large metadata
+            chunk_overlap=200
         )
         
         index = VectorStoreIndex.from_documents(
