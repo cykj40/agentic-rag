@@ -186,9 +186,33 @@ def extract_measurements(text: str) -> List[Dict[str, str]]:
     return measurements
 
 
+def chunk_text(text: str, max_tokens: int = 1000) -> List[str]:
+    """Split text into smaller chunks to stay within token limits."""
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    # Estimate tokens (rough approximation: 1 token ≈ 4 chars)
+    for word in words:
+        word_length = len(word) // 4  # Rough token estimation
+        if current_length + word_length > max_tokens:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+            current_length = word_length
+        else:
+            current_chunk.append(word)
+            current_length += word_length
+    
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    
+    return chunks
+
+
 def process_pdf_to_document(pdf_path: str) -> List[Document]:
     """Process PDF document and extract text, drawings, and measurements.
-    Returns a list of Documents, one per page."""
+    Returns a list of Documents, one per page with proper chunking."""
     doc = fitz.open(pdf_path)
     documents = []
     
@@ -218,16 +242,23 @@ def process_pdf_to_document(pdf_path: str) -> List[Document]:
         for symbol in elements['symbols']:
             content.append(f"Symbol: {symbol['type']} at {symbol['center']}\n")
         
-        # Create a document for this page
-        page_doc = Document(
-            text='\n'.join(content),
-            metadata={
-                'page_number': page.number + 1,
-                'filename': os.path.basename(pdf_path),
-                'page_elements': elements
-            }
-        )
-        documents.append(page_doc)
+        # Join content and chunk it
+        full_content = '\n'.join(content)
+        content_chunks = chunk_text(full_content, max_tokens=1000)
+        
+        # Create a document for each chunk
+        for chunk_idx, chunk in enumerate(content_chunks):
+            chunk_doc = Document(
+                text=chunk,
+                metadata={
+                    'page_number': page.number + 1,
+                    'chunk_number': chunk_idx + 1,
+                    'total_chunks': len(content_chunks),
+                    'filename': os.path.basename(pdf_path),
+                    'page_elements': elements
+                }
+            )
+            documents.append(chunk_doc)
     
     return documents
 
@@ -300,22 +331,22 @@ def initialize_llama_index(documents_path: str = "./documents"):
             if filename.lower().endswith('.pdf'):
                 file_path = os.path.join(documents_path, filename)
                 
-                # Process PDF into per-page documents
+                # Process PDF into per-page documents with chunking
                 page_documents = process_pdf_to_document(file_path)
                 if page_documents:
                     all_documents.extend(page_documents)
-                    print(f"Successfully processed {len(page_documents)} pages from: {filename}")
+                    print(f"Successfully processed {len(page_documents)} chunks from: {filename}")
         
         if not all_documents:
             raise ValueError("No documents were successfully processed")
         
-        # Create index with much larger chunk size for detailed metadata
+        # Create index with standard chunk size (now safe because we pre-chunked the content)
         print("Creating technical document index...")
         from llama_index.core.node_parser import SimpleNodeParser
         
         parser = SimpleNodeParser.from_defaults(
-            chunk_size=500000,  # Increased significantly to handle large metadata
-            chunk_overlap=200
+            chunk_size=4096,
+            chunk_overlap=50
         )
         
         index = VectorStoreIndex.from_documents(
