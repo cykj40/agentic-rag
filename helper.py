@@ -5,7 +5,7 @@ from PIL import Image
 import fitz
 import pytesseract
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Any
 import cv2
 import numpy as np
 import easyocr
@@ -13,6 +13,9 @@ from shapely.geometry import Polygon, box, LineString
 from skimage import feature, morphology, measure
 from scipy import ndimage
 import matplotlib.pyplot as plt
+import pandas as pd
+from io import BytesIO
+import base64
 
 # Configure Tesseract path for Windows
 if os.name == 'nt':  # Windows
@@ -143,18 +146,25 @@ def analyze_blueprint_elements(page: fitz.Page) -> Dict:
     text = page.get_text()
     measurements = extract_measurements(text)
     
+    # Convert numpy types to standard Python types
+    processed_rooms = [{
+        'area_pixels': int(room['area']),  # Convert numpy.int64 to int
+        'perimeter_pixels': float(room['perimeter']),  # Convert numpy.float64 to float
+        'centroid': tuple(float(x) for x in room['centroid']),  # Convert numpy array to tuple of floats
+        'bbox': tuple(int(x) for x in room['bbox'])  # Convert numpy array to tuple of ints
+    } for room in rooms]
+    
     return {
-        'walls': [{'coords': list(wall.coords)} for wall in walls],
-        'rooms': [{
-            'area_pixels': room['area'],
-            'perimeter_pixels': room['perimeter'],
-            'centroid': room['centroid'],
-            'bbox': room['bbox']
-        } for room in rooms],
-        'symbols': symbols,
+        'walls': [{'coords': [(float(x), float(y)) for x, y in wall.coords]} for wall in walls],
+        'rooms': processed_rooms,
+        'symbols': [{
+            'type': symbol['type'],
+            'center': tuple(int(x) for x in symbol['center']),
+            'radius': int(symbol['radius']) if 'radius' in symbol else None
+        } for symbol in symbols],
         'measurements': measurements,
         'page_number': page.number + 1,
-        'page_size': (page.rect.width, page.rect.height)
+        'page_size': (float(page.rect.width), float(page.rect.height))
     }
 
 
@@ -302,11 +312,258 @@ def ocr_pdf_document(pdf_path: str) -> Document:
         return None
 
 
-def initialize_llama_index(documents_path: str = "./documents"):
-    """Initialize RAG system with technical document understanding,
-    handling both text-based and scanned PDFs."""
+def extract_tables_from_pdf(page: fitz.Page) -> List[pd.DataFrame]:
+    """Extract tables from a PDF page and convert them to pandas DataFrames."""
+    tables = []
     try:
-        # Load environment
+        # Extract tables using PyMuPDF's built-in table detection
+        tab = page.find_tables()
+        if tab.tables:
+            for idx, table in enumerate(tab.tables):
+                # Convert table to a list of lists
+                data = [cell.text.strip() for row in table.cells for cell in row]
+                rows = table.cells
+                if rows:
+                    # Create DataFrame
+                    df = pd.DataFrame(data)
+                    # Try to detect header
+                    if len(df) > 1:
+                        df.columns = df.iloc[0]
+                        df = df[1:]
+                    tables.append(df)
+    except Exception as e:
+        print(f"Error extracting tables: {str(e)}")
+    return tables
+
+
+def extract_technical_content(text: str) -> Dict[str, Any]:
+    """Extract technical content like equations, measurements, and specifications."""
+    technical_data = {
+        'equations': [],
+        'measurements': [],
+        'specifications': [],
+        'references': []
+    }
+    
+    # Extract equations (basic pattern)
+    equation_pattern = r'(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*[-+*/\d\s.()]+)|(?:\$[^$]+\$)'
+    technical_data['equations'] = re.findall(equation_pattern, text)
+    
+    # Extract measurements
+    measurement_pattern = r'\b\d+(?:\.\d+)?\s*(?:mm|cm|m|kg|g|N|Pa|MPa|°C|°F|Hz|kHz|MHz|W|kW|MW|V|kV|A|mA|Ω|μm|nm)\b'
+    technical_data['measurements'] = re.findall(measurement_pattern, text)
+    
+    # Extract specifications (key-value pairs)
+    spec_pattern = r'(?:^|\n)([A-Za-z\s]+):\s*([^:\n]+)'
+    technical_data['specifications'] = re.findall(spec_pattern, text)
+    
+    # Extract references
+    ref_pattern = r'\[(\d+)\]|\[([\w\-]+)\]'
+    technical_data['references'] = re.findall(ref_pattern, text)
+    
+    return technical_data
+
+
+def create_visualization(data: Dict[str, Any], viz_type: str) -> Optional[str]:
+    """Create visualizations based on the data type and return as base64 encoded string."""
+    try:
+        plt.figure(figsize=(10, 6))
+        
+        if viz_type == 'bar' and isinstance(data, dict):
+            plt.bar(list(data.keys()), list(data.values()))
+            plt.xticks(rotation=45)
+        elif viz_type == 'line' and isinstance(data, dict):
+            plt.plot(list(data.keys()), list(data.values()))
+            plt.xticks(rotation=45)
+        elif viz_type == 'pie' and isinstance(data, dict):
+            plt.pie(list(data.values()), labels=list(data.keys()), autopct='%1.1f%%')
+        elif viz_type == 'table' and isinstance(data, pd.DataFrame):
+            plt.axis('off')
+            plt.table(cellText=data.values, colLabels=data.columns, cellLoc='center', loc='center')
+        
+        # Save plot to bytes buffer
+        buffer = BytesIO()
+        plt.savefig(buffer, format='png', bbox_inches='tight')
+        plt.close()
+        
+        # Convert to base64
+        image_base64 = base64.b64encode(buffer.getvalue()).decode()
+        return image_base64
+    except Exception as e:
+        print(f"Error creating visualization: {str(e)}")
+        return None
+
+
+def extract_financial_content(text: str) -> Dict[str, Any]:
+    """Extract financial data like metrics, ratios, and market data."""
+    financial_data = {
+        'metrics': [],
+        'ratios': [],
+        'market_data': [],
+        'dates': [],
+        'currency_amounts': []
+    }
+    
+    # Extract currency amounts and financial figures
+    currency_pattern = r'\$?\s*\d+(?:,\d{3})*(?:\.\d+)?(?:\s*(?:million|billion|trillion|M|B|T))?\b'
+    financial_data['currency_amounts'] = re.findall(currency_pattern, text)
+    
+    # Extract financial metrics
+    metric_pattern = r'(?:revenue|profit|income|EBITDA|EPS|ROE|ROI|margin|growth)\s*(?:of|:)?\s*' + currency_pattern
+    financial_data['metrics'] = re.findall(metric_pattern, text, re.IGNORECASE)
+    
+    # Extract financial ratios
+    ratio_pattern = r'(?:P/E|price[/-]to[/-]earnings|debt[/-]to[/-]equity|current ratio|quick ratio|ROE|ROA)\s*(?:of|:)?\s*\d+\.?\d*'
+    financial_data['ratios'] = re.findall(ratio_pattern, text, re.IGNORECASE)
+    
+    # Extract market data
+    market_pattern = r'(?:stock price|market cap|volume|shares outstanding|dividend|yield)\s*(?:of|:)?\s*' + currency_pattern
+    financial_data['market_data'] = re.findall(market_pattern, text, re.IGNORECASE)
+    
+    # Extract dates (for quarterly/annual reports)
+    date_pattern = r'\b(?:Q[1-4]\s+\d{4}|FY\s+\d{4}|\d{4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b'
+    financial_data['dates'] = re.findall(date_pattern, text)
+    
+    return financial_data
+
+
+def create_financial_visualization(data: Dict[str, Any], viz_type: str) -> Optional[str]:
+    """Create financial visualizations based on the data type."""
+    try:
+        plt.style.use('seaborn')  # Use a clean style for financial charts
+        plt.figure(figsize=(12, 6))
+        
+        if viz_type == 'line':
+            # Time series data
+            plt.plot(list(data.keys()), list(data.values()), marker='o')
+            plt.grid(True)
+            plt.xticks(rotation=45)
+            plt.title('Time Series Analysis')
+            
+        elif viz_type == 'bar':
+            # Comparative data
+            plt.bar(list(data.keys()), list(data.values()))
+            plt.grid(True, axis='y')
+            plt.xticks(rotation=45)
+            
+        elif viz_type == 'pie':
+            # Distribution data
+            plt.pie(list(data.values()), labels=list(data.keys()), autopct='%1.1f%%')
+            plt.title('Distribution Analysis')
+            
+        elif viz_type == 'candlestick' and isinstance(data, pd.DataFrame):
+            # Check if we have OHLC data
+            if all(col in data.columns for col in ['Open', 'High', 'Low', 'Close']):
+                from mplfinance.original_flavor import candlestick_ohlc
+                import matplotlib.dates as mdates
+                
+                # Convert data for candlestick chart
+                quotes = []
+                for index, row in data.iterrows():
+                    quotes.append((mdates.date2num(index), row['Open'], 
+                                 row['High'], row['Low'], row['Close']))
+                
+                candlestick_ohlc(plt.gca(), quotes, width=0.6, 
+                                colorup='g', colordown='r')
+                plt.grid(True)
+                plt.xticks(rotation=45)
+        
+        # Add financial chart specific formatting
+        plt.tight_layout()
+        
+        # Save plot to bytes buffer
+        buffer = BytesIO()
+        plt.savefig(buffer, format='png', bbox_inches='tight', dpi=300)
+        plt.close()
+        
+        # Convert to base64
+        image_base64 = base64.b64encode(buffer.getvalue()).decode()
+        return image_base64
+    except Exception as e:
+        print(f"Error creating financial visualization: {str(e)}")
+        return None
+
+
+def process_document(file_path: str) -> List[Document]:
+    """Process a document and extract text content with financial analysis.
+    Returns a list of Document objects with enhanced financial content."""
+    documents = []
+    
+    try:
+        if file_path.lower().endswith('.pdf'):
+            doc = fitz.open(file_path)
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                text = page.get_text()
+                
+                if text.strip():
+                    # Extract financial content
+                    financial_data = extract_financial_content(text)
+                    
+                    # Extract tables (potential financial statements)
+                    tables = extract_tables_from_pdf(page)
+                    
+                    # Create enhanced metadata
+                    metadata = {
+                        'source': file_path,
+                        'page_number': page_num + 1,
+                        'filename': os.path.basename(file_path),
+                        'financial_data': financial_data,
+                        'has_tables': len(tables) > 0,
+                        'table_count': len(tables),
+                        'tables': [df.to_dict() for df in tables] if tables else []
+                    }
+                    
+                    # Create document with enhanced content
+                    doc = Document(
+                        text=text,
+                        metadata=metadata
+                    )
+                    documents.append(doc)
+            
+            print(f"Processed {len(documents)} pages from PDF: {os.path.basename(file_path)}")
+            
+    except Exception as e:
+        print(f"Error processing document {file_path}: {str(e)}")
+        traceback.print_exc()
+    
+    return documents
+
+
+def process_text_content(text: str, source_name: str = "Pasted Text") -> Document:
+    """Process pasted text content and extract financial information."""
+    try:
+        if text.strip():
+            # Extract financial content
+            financial_data = extract_financial_content(text)
+            
+            # Create metadata
+            metadata = {
+                'source': source_name,
+                'filename': source_name,
+                'financial_data': financial_data,
+                'content_type': 'text'
+            }
+            
+            # Create document with the content
+            doc = Document(
+                text=text,
+                metadata=metadata
+            )
+            
+            print(f"Processed text content from: {source_name}")
+            return doc
+            
+    except Exception as e:
+        print(f"Error processing text content: {str(e)}")
+        traceback.print_exc()
+        return None
+
+
+def initialize_index(documents_path: str = "./documents", text_content: Optional[str] = None, text_source: Optional[str] = None) -> Optional[VectorStoreIndex]:
+    """Initialize the financial document Q&A system with both PDF and text content."""
+    try:
+        # Load environment variables
         load_dotenv(find_dotenv())
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -324,37 +581,30 @@ def initialize_llama_index(documents_path: str = "./documents"):
         )
         
         # Process documents
-        print(f"Processing technical documents from: {documents_path}")
         all_documents = []
         
-        for filename in os.listdir(documents_path):
-            if filename.lower().endswith('.pdf'):
+        # Process PDFs if directory exists
+        if os.path.exists(documents_path):
+            print(f"Processing documents from: {documents_path}")
+            for filename in os.listdir(documents_path):
                 file_path = os.path.join(documents_path, filename)
-                
-                # Process PDF into per-page documents with chunking
-                page_documents = process_pdf_to_document(file_path)
-                if page_documents:
-                    all_documents.extend(page_documents)
-                    print(f"Successfully processed {len(page_documents)} chunks from: {filename}")
+                if filename.lower().endswith('.pdf'):
+                    documents = process_document(file_path)
+                    all_documents.extend(documents)
+        
+        # Process pasted text if provided
+        if text_content:
+            text_doc = process_text_content(text_content, text_source or "Pasted Text")
+            if text_doc:
+                all_documents.append(text_doc)
         
         if not all_documents:
-            raise ValueError("No documents were successfully processed")
+            raise ValueError("No content was successfully processed")
         
-        # Create index with standard chunk size (now safe because we pre-chunked the content)
-        print("Creating technical document index...")
-        from llama_index.core.node_parser import SimpleNodeParser
-        
-        parser = SimpleNodeParser.from_defaults(
-            chunk_size=4096,
-            chunk_overlap=50
-        )
-        
-        index = VectorStoreIndex.from_documents(
-            all_documents,
-            transformations=[parser]
-        )
-        
-        print("Technical document index created successfully")
+        # Create index
+        print("Creating document index...")
+        index = VectorStoreIndex.from_documents(all_documents)
+        print("Document index created successfully")
         return index
         
     except Exception as e:
@@ -364,22 +614,27 @@ def initialize_llama_index(documents_path: str = "./documents"):
 
 
 def create_chat_engine(index):
-    """Create a specialized chat engine for technical documents"""
+    """Create an enhanced chat engine for financial document analysis."""
     return index.as_chat_engine(
         chat_mode="context",
         verbose=True,
         system_prompt=(
-            "You are an expert in analyzing technical drawings and blueprints. "
-            "Focus on providing precise information about:\n"
-            "1. Room layouts and dimensions\n"
-            "2. Wall locations and lengths\n"
-            "3. Architectural symbols and their meanings\n"
-            "4. Measurements and scale information\n"
-            "\nWhen discussing measurements:\n"
-            "- Convert pixel measurements to real units when scale information is available\n"
-            "- Provide context about where elements are located\n"
-            "- Explain relationships between different spaces\n"
-            "\nIf you're unsure about any measurements or interpretations, say so."
+            "You are an expert financial analyst specializing in analyzing financial documents, "
+            "earnings reports, and market data. Your capabilities include:\n"
+            "1. Analyzing financial statements and metrics\n"
+            "2. Interpreting earnings calls and quarterly reports\n"
+            "3. Creating financial visualizations and charts\n"
+            "4. Calculating key financial ratios and indicators\n"
+            "5. Providing market analysis and insights\n\n"
+            "When responding:\n"
+            "- Present financial data in clear, structured tables\n"
+            "- Create visualizations for trend analysis\n"
+            "- Highlight key financial metrics and their implications\n"
+            "- Compare current vs historical performance\n"
+            "- Explain financial terms and calculations\n"
+            "- Cite specific sections from financial reports\n"
+            "If you're unsure about any financial details, acknowledge the uncertainty "
+            "and explain what additional data would be needed for a complete analysis."
         )
     )
 
